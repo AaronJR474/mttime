@@ -151,9 +151,13 @@ class Inversion(object):
         G = self.G[ind, :]
         w = self.w[ind]
 
-        Gt = (G).transpose()
-        Gtd = np.dot(Gt, np.dot(np.diag(w), d))
-        GtG = np.dot(Gt, np.dot(np.diag(w), G))
+        # Gt = (G).transpose()
+        # Gtd = np.dot(Gt, np.dot(np.diag(w), d))
+        # GtG = np.dot(Gt, np.dot(np.diag(w), G))
+
+        Gt = G.T
+        Gtd = Gt @ (w * d)
+        GtG = Gt @ (w[:, None] * G)
 
         # Compute the inverse GtGinv
         a = utils.gaussj(GtG, Gtd)
