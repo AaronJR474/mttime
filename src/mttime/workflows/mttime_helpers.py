@@ -74,6 +74,17 @@ are regenerated automatically. ``overwrite=True`` bypasses the cache and
 forces regeneration. This prevents an existing output from producing an empty
 station or Green's-function manifest.
 
+Version 0.4.4
+-------------
+Package installs now resolve ``gf_helpers`` relative to ``mttime.workflows``
+inside :func:`generate_pyfk_gfs`. This prevents a separately imported or stale
+top-level ``gf_helpers`` module from creating a second ``VelocityGrid3D`` class
+identity and causing valid grids returned by
+``mttime.workflows.gf_helpers.build_regular_velocity_grid`` to fail the backend
+type check. Standalone helper-file use remains supported when no package context
+is present. Numerical Green's-function generation and cache contracts are
+unchanged.
+
 Version 0.4.3
 -------------
 ``run_mttime_inversion`` adds ``"cmt"`` to the helper-managed plot views and
@@ -295,11 +306,11 @@ from numpy.typing import ArrayLike
 import pandas as pd
 from pyproj import Geod
 
-__version__ = "0.4.3"
+__version__ = "0.4.4"
 
-# Cache compatibility is backend-specific. Version 0.4.3 changes plotting
-# orchestration only and therefore retains the 0.4.x observation/GF cache
-# contracts.
+# Cache compatibility is backend-specific. Versions 0.4.3-0.4.4 change only
+# plotting orchestration and package-relative sibling-module resolution, so the
+# 0.4.x observation/GF cache contracts remain valid.
 _OBSERVATION_CACHE_COMPAT_VERSION = "0.4.0"
 _PYFK_CACHE_COMPAT_VERSION = "0.4.0"
 _SYNGINE_CACHE_COMPAT_VERSION = "0.4.1"
@@ -1990,6 +2001,22 @@ def process_mseed_sac(
     return output_stream, processed_station_df, processing_log
 
 
+def _load_gf_helpers_module():
+    """Return the sibling :mod:`gf_helpers` module with stable class identity.
+
+    Installed MTtime workflows must import the sibling relatively. Importing
+    ``gf_helpers`` as a top-level module can load the same source file under a
+    second module name, making ``VelocityGrid3D`` fail ``isinstance`` checks.
+    The absolute fallback is retained only for historical standalone use of
+    ``mttime_helpers.py`` outside the :mod:`mttime.workflows` package.
+    """
+    if __package__:
+        from . import gf_helpers as gf_helpers_module
+    else:
+        import gf_helpers as gf_helpers_module
+    return gf_helpers_module
+
+
 def generate_pyfk_gfs(
     event_df: pd.DataFrame | pd.Series | Mapping[str, Any],
     station_df: pd.DataFrame,
@@ -2168,11 +2195,12 @@ def generate_pyfk_gfs(
     from tqdm.auto import tqdm
     import pyfk as pyfk_module
     from pyfk import Config, SeisModel, SourceModel, calculate_gf
-    import gf_helpers as gf_helpers_module
-    from gf_helpers import (
-        VelocityGrid3D, get_profile_from_path, layers_to_pyfk_array,
-        profile_to_pyfk_layers, write_mttime_herrmann_sac,
-    )
+    gf_helpers_module = _load_gf_helpers_module()
+    VelocityGrid3D = gf_helpers_module.VelocityGrid3D
+    get_profile_from_path = gf_helpers_module.get_profile_from_path
+    layers_to_pyfk_array = gf_helpers_module.layers_to_pyfk_array
+    profile_to_pyfk_layers = gf_helpers_module.profile_to_pyfk_layers
+    write_mttime_herrmann_sac = gf_helpers_module.write_mttime_herrmann_sac
 
     if station_df.empty:
         raise ValueError("station_df is empty.")
