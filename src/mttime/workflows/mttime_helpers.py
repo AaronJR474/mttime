@@ -74,6 +74,20 @@ are regenerated automatically. ``overwrite=True`` bypasses the cache and
 forces regeneration. This prevents an existing output from producing an empty
 station or Green's-function manifest.
 
+Version 0.4.5
+-------------
+Nested inversion workflows now resolve observation and Green's-function input
+directories independently of their newly created analysis output trees. Relative
+paths are searched from the workflow root through its parent directories and
+then from the current working directory, so both ``"processed/data"`` and
+``output_path / "processed/data"`` remain valid when origin-shift scans or
+resampling runs are written below an event directory. Stable absolute input
+paths are then forwarded to every temporary/run-specific ``mtinv.in`` project.
+This fixes duplicated paths such as
+``origin_shift_scan/<event_id>/processed/data`` without changing inversion or
+Green's-function numerics. The same resolver is used by
+:func:`run_mttime_resampling` to remove the analogous latent path-rebasing bug.
+
 Version 0.4.4
 -------------
 Package installs now resolve ``gf_helpers`` relative to ``mttime.workflows``
@@ -306,11 +320,11 @@ from numpy.typing import ArrayLike
 import pandas as pd
 from pyproj import Geod
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"
 
-# Cache compatibility is backend-specific. Versions 0.4.3-0.4.4 change only
-# plotting orchestration and package-relative sibling-module resolution, so the
-# 0.4.x observation/GF cache contracts remain valid.
+# Cache compatibility is backend-specific. Versions 0.4.3-0.4.5 change only
+# plotting/workflow orchestration, path resolution and package-relative sibling-
+# module resolution, so the 0.4.x observation/GF cache contracts remain valid.
 _OBSERVATION_CACHE_COMPAT_VERSION = "0.4.0"
 _PYFK_CACHE_COMPAT_VERSION = "0.4.0"
 _SYNGINE_CACHE_COMPAT_VERSION = "0.4.1"
@@ -4494,8 +4508,11 @@ def mttime_inversion_oshift(
     correlate, drop_stations
         Configuration arguments forwarded to :func:`run_mttime_inversion`;
         ``components`` accepts ``"ZRT"``, ``"ZR"`` or ``"Z"``. It invokes
-        :func:`write_mtinv` internally. Paths are resolved relative
-        to the scan root before being written into each run-specific project.
+        :func:`write_mtinv` internally. For these nested workflows, relative
+        input directories are resolved once against the nearest existing parent
+        of the scan root (with the current working directory as a final
+        fallback), then passed to every run as stable absolute paths. This keeps
+        existing observations and Green's functions outside the scan tree.
     plot_views, waveform_option, figure_format, figure_dpi, show, write_option,
     save_tables, strict_plots, correlation_abs_max
         Forwarded to :func:`run_mttime_inversion`. ``show`` controls interactive
@@ -4572,8 +4589,12 @@ def mttime_inversion_oshift(
 
     root = Path(output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    data_root = _resolve_from_config(root, path_to_data).expanduser().resolve()
-    green_root = _resolve_from_config(root, path_to_green).expanduser().resolve()
+    data_root = _resolve_nested_workflow_input_directory(
+        root, path_to_data, label="Observed-data"
+    )
+    green_root = _resolve_nested_workflow_input_directory(
+        root, path_to_green, label="Green's-function"
+    )
 
     summary_rows: list[dict[str, Any]] = []
     solution_tables: list[pd.DataFrame] = []
@@ -6178,8 +6199,10 @@ def run_mttime_resampling(
         figures, text solutions or CSV files are retained.
 
     path_to_data, path_to_green
-        Observation and Green's-function paths supplied to
-        :func:`write_mtinv`.
+        Observation and Green's-function directories. Relative paths are
+        resolved once before resampling by searching from ``output_dir`` upward
+        through its parents and then from the current working directory. The
+        resolved absolute directories are reused by every temporary inversion.
 
     depths_km
         Trial source depths. ``None`` allows :func:`write_mtinv` to infer the
@@ -6341,6 +6364,12 @@ def run_mttime_resampling(
 
     root = Path(output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
+    data_root = _resolve_nested_workflow_input_directory(
+        root, path_to_data, label="Observed-data"
+    )
+    green_root = _resolve_nested_workflow_input_directory(
+        root, path_to_green, label="Green's-function"
+    )
 
     table = station_df.copy()
 
@@ -6460,8 +6489,8 @@ def run_mttime_resampling(
                     table,
                     gf_manifest,
                     output_file=mtinv_path,
-                    path_to_data=path_to_data,
-                    path_to_green=path_to_green,
+                    path_to_data=data_root,
+                    path_to_green=green_root,
                     depths_km=depths_km,
                     components=components,
                     degree=degree,
@@ -10151,6 +10180,58 @@ def _normalize_station_selector(value) -> str:
         network, station, location = value
         return f"{network}.{station}.{location or '--'}"
     raise TypeError("drop_stations entries must be station_id strings or (network, station, location) tuples.")
+
+
+def _resolve_nested_workflow_input_directory(
+    workflow_root: Path,
+    path: str | Path,
+    *,
+    label: str,
+) -> Path:
+    """Resolve an existing input directory for a nested MTtime workflow.
+
+    ``mttime_inversion_oshift`` and ``run_mttime_resampling`` create temporary
+    or run-specific ``mtinv.in`` files below their own output trees. Relative
+    observation/GF paths must therefore not be interpreted relative to those
+    newly created directories. The resolver searches from the workflow root
+    upward through its parents and finally from the current working directory,
+    returning the nearest existing directory. Absolute paths are used directly.
+
+    This supports both common call styles without path duplication::
+
+        path_to_data="processed/data"
+        path_to_data=output_path / "processed/data"
+
+    where ``output_path`` itself may be a relative event directory.
+    """
+    workflow_root = Path(workflow_root).expanduser().resolve()
+    raw = Path(path).expanduser()
+
+    if raw.is_absolute():
+        resolved = raw.resolve()
+        if not resolved.is_dir():
+            raise FileNotFoundError(f"{label} directory does not exist: {resolved}")
+        return resolved
+
+    bases: list[Path] = [workflow_root, *workflow_root.parents, Path.cwd()]
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    for base in bases:
+        candidate = (base / raw).expanduser().resolve()
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(candidate)
+        if candidate.is_dir():
+            return candidate
+
+    tried = "\n  - ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(
+        f"{label} directory could not be resolved from relative path {str(raw)!r}. "
+        f"Tried:\n  - {tried}"
+    )
 
 
 def _resolve_from_config(config_root: Path, path: str | Path) -> Path:
