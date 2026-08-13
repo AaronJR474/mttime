@@ -1,70 +1,73 @@
-
 .. _getting_started:
 
 ===============
 Getting started
 ===============
 
-Requirements
-------------
-The package was developed on python 3.7 and 3.8, and is running and tested on Mac OSX.
+Supported installation model
+----------------------------
 
-* ObsPy 1.0.* and its dependencies
-* pandas 1.0.*
+This fork is intended to be directly installable from Git. The upstream MTtime
+core remains in ``mttime.core`` and the additive orchestration lives in
+``mttime.workflows``.
 
-Installation
-------------
+The fork currently declares Python 3.8--3.12 support. The supported PyFK
+workflow is Linux/WSL, while Syngine does not require PyFK.
 
-* Create a Python environment
-* Install ObsPy and pandas
-* Make sure you have `cloned the repository <https://github.com/LLNL/mttime>`_
-* Install mttime
-
-I recommend installing Python via `Miniconda <https://docs.conda.io/en/latest/miniconda.html>`_
-or `Anaconda <https://docs.anaconda.com/anaconda/install/>`_. Choose Miniconda for a lower footprint.
-Then follow the instructions on their sites to install
-`ObsPy <https://github.com/obspy/obspy/wiki/Installation-via-Anaconda>`_
-and `pandas <https://pandas.pydata.org/pandas-docs/stable/getting_started/install.html>`_
-for your given platform.
-
-Download mttime and install it from source. If you installed Python via conda make sure you activate
-the environment where ObsPy and pandas are installed.
+Default Linux/WSL installation
+------------------------------
 
 .. code-block:: bash
 
-   # Activate environment
-   conda activate your_environment
+   python -m pip install --upgrade pip
+   python -m pip install "git+https://github.com/AaronJR474/mttime.git"
 
-   # Build and install mttime
-   git clone https://github.com/LLNL/mttime
-   cd mttime
-   python setup.py install
+On Python 3.10--3.12 the installation pins the modernized PyFK PR #20 commit
+recorded in ``setup.py`` because the currently published PyFK metadata remains
+restricted to Python <3.10. Once upstream PyFK publishes a compatible release,
+the direct VCS pin should be removed in favour of that release.
 
-Finally, if you want to run the tutorials you will need to install `Jupyter Notebook <https://jupyter.org/install>`_.
+Installation without PyFK
+--------------------------
 
-Usage
------
-
-You can execute the package from the command line or run it interactively in the Python console.
-In either case you will need to provide an input file that contains information about the
-file structure and parameters to set up the inverse routine.
-If no file is given the code will look for a file named **mtinv.in** in the current working directory.
-
-Executing the package from command line will launch the inversion,
-save and plot the result to file:
+On Linux/WSL, use the fork-specific build switch when only Syngine or externally
+prepared Green's functions are needed:
 
 .. code-block:: bash
 
-   mttime-run mtinv.in
+   MTTIME_NO_PYFK=1 python -m pip install "git+https://github.com/AaronJR474/mttime.git"
 
-The equivalent in the Python console:
+Native Windows and macOS installations skip the automatic PyFK dependency in the
+package metadata. This restriction is deliberate for this fork's supported/tested
+PyFK route; it does not imply that every upstream PyFK configuration on every
+other Unix-like platform is impossible.
+
+Optional map plotting
+---------------------
+
+.. code-block:: bash
+
+   python -m pip install "mttime[maps] @ git+https://github.com/AaronJR474/mttime.git"
+
+Core MTtime usage
+-----------------
 
 .. code-block:: python
 
-   >>> import mttime
-   >>> config = mttime.Configure(path_to_file="mtinv.in")
-   >>> mt = mttime.Inversion(config=config)
-   >>> mt.invert()
-   >>> mt.write()
+   import mttime
 
-Refer to the :ref:`user_guide` for more details.
+   config = mttime.Configure(path_to_file="mtinv.in")
+   mt = mttime.Inversion(config=config)
+   mt.invert()
+   mt.write()
+
+Workflow usage
+--------------
+
+.. code-block:: python
+
+   from mttime.workflows import gf_helpers, mttime_helpers
+
+The helpers are packaged with MTtime itself; copying ``workflows`` into a working
+directory or editing ``PYTHONPATH`` is not required. Continue with
+:ref:`workflows` for the end-to-end workflow and Green's-function choices.

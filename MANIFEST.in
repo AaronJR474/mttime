@@ -1,1 +1,6 @@
-include src/mttime/imaging/styles/*
+include LICENSE
+include NOTICE
+include README.rst
+include CHANGELOG.rst
+include pyproject.toml
+recursive-include src/mttime/imaging/styles *

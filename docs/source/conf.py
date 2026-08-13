@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# SPDX-License-Identifier: (BSD-3)
+# SPDX-License-Identifier: LGPL-3.0-only
 # LLNL-CODE-805542
 # author: Andrea Chiang (andrea4@llnl.gov)
 #

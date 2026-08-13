@@ -3,6 +3,24 @@ Changelog
 
 Current release is version 1.1.0
 
+Fork workflow update (2026-08-13)
+---------------------------------
+
+- Package ``mttime.workflows`` as an installed subpackage by adding its missing
+  ``__init__.py``.
+- Add a PEP 517 ``pyproject.toml`` build declaration for direct ``pip``/Git
+  installations.
+- Install the supported PyFK backend automatically on Linux/WSL, with a pinned
+  Python-3.10--3.12 upstream PR commit and a fork-specific ``MTTIME_NO_PYFK``
+  opt-out for Syngine-only installs.
+- Document the workflow helpers, 1-D and 3-D-model-informed PyFK routes, external
+  3-D tensor GFs and the independent EarthScope Syngine backend.
+- Add the helper-managed ``cmt`` plot view using ``plot_cmt_summary``.
+- Retain the weighted-normal-equation row-scaling improvement in the inversion,
+  avoiding construction of a dense diagonal weight matrix.
+- Replace the conflicted license file with clean LGPL-3.0 text and align package
+  metadata with the upstream LGPL license; retain the LLNL NOTICE.
+
 
 2026-04-14
 ----------

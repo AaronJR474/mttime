@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# SPDX-License-Identifier: (LGPL-3.0)
+# SPDX-License-Identifier: LGPL-3.0-only
 # LLNL-CODE-814839
 # author: Andrea Chiang (andrea@llnl.gov)
 """
@@ -12,7 +12,7 @@ to obtain the seismic moment tensor.
 :copyright:
     Copyright (c) 2020, Lawrence Livermore National Security, LLC
 :license:
-    BSD 3-Clause License
+    GNU Lesser General Public License v3.0
 """
 
 # Generic release markers:
@@ -22,7 +22,7 @@ to obtain the seismic moment tensor.
 # dev branch marker is "X.Y.devN" where N is an integer.
 # X.Y.dev0 is the canonical version of X.Y.dev
 
-__version__ = "1.1.dev0"
+__version__ = "1.1.0"
 
 from mttime.core.configure import Configure
 from mttime.core.inversion import Inversion

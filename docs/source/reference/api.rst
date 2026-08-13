@@ -32,6 +32,17 @@ Plotting Modules
    mttime.imaging.source
    mttime.imaging.beachball
 
+Workflow Modules
+----------------
+
+.. autosummary::
+   :template: module.rst
+   :toctree: autogen
+   :nosignatures:
+
+   mttime.workflows.mttime_helpers
+   mttime.workflows.gf_helpers
+
 Scripts
 -------
 

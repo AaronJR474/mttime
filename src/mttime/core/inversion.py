@@ -151,10 +151,9 @@ class Inversion(object):
         G = self.G[ind, :]
         w = self.w[ind]
 
-        # Gt = (G).transpose()
-        # Gtd = np.dot(Gt, np.dot(np.diag(w), d))
-        # GtG = np.dot(Gt, np.dot(np.diag(w), G))
-
+        # Apply diagonal weights by row scaling instead of allocating the dense
+        # matrix diag(w). This is algebraically identical to G.T @ diag(w) but
+        # avoids an O(n_data**2) temporary allocation.
         Gt = G.T
         Gtd = Gt @ (w * d)
         GtG = Gt @ (w[:, None] * G)

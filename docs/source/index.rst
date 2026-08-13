@@ -15,6 +15,7 @@ Documentation
    :maxdepth: 2
 
    getting_started
+   workflows
    user_guide
    reference/api
 
