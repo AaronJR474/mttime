@@ -8541,9 +8541,9 @@ def _validate_station_depth_policy(station_df: pd.DataFrame) -> None:
         policy = _optional_boolean(row_dict.get("ground_level"), "ground_level")
         if policy is None:
             continue
-        depth = row_dict.get(
-            "input_channel_depth_m", row_dict.get("channel_depth_m")
-        )
+        depth = row_dict.get("input_channel_depth_m")
+        if depth is None or pd.isna(depth):
+            depth = row_dict.get("channel_depth_m")
         if depth is None or pd.isna(depth):
             if policy:
                 station_id = row_dict.get("station_id", "<unknown>")
