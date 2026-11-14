@@ -153,7 +153,9 @@ class Configure(object):
         with open(path_to_file, "r") as f:
             for key, parse in types.items():
                 try:
-                    header[key] = parse(next(f).split()[1])
+                    line = next(f)
+                    maxsplit = 1 if key in {"path_to_data", "path_to_green"} else -1
+                    header[key] = parse(line.split(maxsplit=maxsplit)[1].strip())
                 except IndexError:
                     msg = "'%s' missing in %s." % (key, path_to_file)
                     warnings.warn(msg)

@@ -58,9 +58,9 @@ and MTtime trial depth share the same datum.
 Station-selection convention
 ----------------------------
 Regional station discovery uses an inclusive ``min_radius_km``--``max_radius_km``
-annulus. The minimum remains a configurable regional-workflow choice (100 km by
-default), while ``max_radius_km=None`` derives the outer radius from magnitude
-through :func:`get_max_radius`; an explicit ``max_radius_km`` remains a direct
+annulus. The default minimum is zero, and ``max_radius_km=None`` derives the
+outer radius from magnitude through :func:`get_max_radius`. An explicit
+``max_radius_km`` remains a direct
 user override. By default, only selected three-component families whose
 StationXML ``Channel.depth`` is zero are retained, preventing borehole or other
 below-surface sensors from being mixed inadvertently with surface records.
@@ -73,6 +73,13 @@ reused and returned normally. Missing, partial, corrupt or incompatible files
 are regenerated automatically. ``overwrite=True`` bypasses the cache and
 forces regeneration. This prevents an existing output from producing an empty
 station or Green's-function manifest.
+
+Version 0.4.6
+-------------
+``run_auto_cmt`` joins the existing acquisition and inversion stages with
+PyFK, Syngine or prepared MTtime SAC inputs. The station controls add
+45-degree sector selection and exact station omissions on solved depth and
+reference-time candidates. The default inner acquisition radius is now 0 km.
 
 Version 0.4.5
 -------------
@@ -306,23 +313,23 @@ very thin velocity-model interfaces.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, NamedTuple, Sequence
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
+from itertools import combinations
 
 import hashlib
 import os
 import json
 import io
-import uuid
 
 import numpy as np
 from numpy.typing import ArrayLike
 import pandas as pd
 from pyproj import Geod
 
-__version__ = "0.4.5"
+__version__ = "0.4.6"
 
-# Cache compatibility is backend-specific. Versions 0.4.3-0.4.5 change only
+# Cache compatibility is backend-specific. Versions 0.4.3-0.4.6 change only
 # plotting/workflow orchestration, path resolution and package-relative sibling-
 # module resolution, so the 0.4.x observation/GF cache contracts remain valid.
 _OBSERVATION_CACHE_COMPAT_VERSION = "0.4.0"
@@ -340,6 +347,7 @@ __all__ = [
     "write_mtinv",
     "run_mttime_inversion",
     "mttime_inversion_oshift",
+    "run_auto_cmt",
     "select_opposing_station_pairs",
     "run_mttime_resampling",
     "plot_cmt_summary",
@@ -352,10 +360,10 @@ _TENSOR_BASES = tuple(
     for component in ("Z", "R", "T")
     for basis in ("xx", "yy", "zz", "xy", "xz", "yz")
 )
-_SYNGINE_MTTIME_REFERENCE_MOMENT_NM = 1.0e13  # 1e20 dyne-cm
+_MTTIME_REFERENCE_MOMENT_NM = 1.0e13  # 1e20 dyne-cm
 _SYNGINE_SI_TO_CM_SCALE = 100.0
 _SYNGINE_MTTIME_AMPLITUDE_SCALE = (
-    _SYNGINE_MTTIME_REFERENCE_MOMENT_NM * _SYNGINE_SI_TO_CM_SCALE
+    _MTTIME_REFERENCE_MOMENT_NM * _SYNGINE_SI_TO_CM_SCALE
 )
 _COMPONENT_SCHEMES = ("ZNE", "Z12", "123")
 _GROUND_LEVEL_DEPTH_ATOL_M = 1e-6
@@ -364,6 +372,17 @@ _CHANNEL_ELEVATION_ATOL_M = 1.0
 _SAMPLE_INTERVAL_ATOL_S = 1e-8
 _SAMPLE_INTERVAL_RTOL = 1e-6
 _PYFK_CONFIG_DEFAULTS = {"dk": 0.15, "kmax": 15.0}
+_AZIMUTH_CONTROL_DEFAULTS = {
+    "azimuth_selection": True,
+    "azimuth_min_sectors": 3,
+    "azimuth_max_stations_per_sector": 2,
+    "minimum_stations": 4,
+}
+_JACKKNIFE_DEFAULTS = {
+    "jackknife_min_stations": 4,
+    "jackknife_opposing_station": False,
+    "jackknife_opposition_tolerance_deg": 20.0,
+}
 _EVENT_ALIASES = {
     "event_id": ("event_id", "eventid", "evid"),
     "origin_time": ("origin_time", "origin", "datetime", "time"),
@@ -657,7 +676,7 @@ def get_mseed_stationxml(
     *,
     magnitude: float | None = None,
     client: str | Sequence[str | Any] | Any = "GEONET",
-    min_radius_km: float = 100.0,
+    min_radius_km: float = 0.0,
     max_radius_km: float | None = None,
     radius_scale_factor: float = 1.66,
     ground_level: bool = True,
@@ -668,6 +687,7 @@ def get_mseed_stationxml(
     taup_model: str = "iasp91",
     output_dir: str | Path,
     overwrite: bool = False,
+    processing_window: Mapping[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Discover stations and download event-specific miniSEED and StationXML.
 
@@ -675,7 +695,7 @@ def get_mseed_stationxml(
     to sensors installed at the local ground surface. The annular selection is a
     configurable workflow policy for regional moment-tensor inversion rather
     than a universal physical requirement. The minimum radius defaults to
-    100 km. When ``max_radius_km=None`` (default), the outer radius is derived
+    0 km. When ``max_radius_km=None`` (default), the outer radius is derived
     from ``magnitude`` with :func:`get_max_radius`; an explicit maximum radius
     overrides that calculation exactly.
 
@@ -704,7 +724,7 @@ def get_mseed_stationxml(
         client supplies the same network/station/location identifier.
     min_radius_km, max_radius_km
         Inclusive minimum and maximum epicentral distances in kilometres.
-        ``min_radius_km`` defaults to 100 km. ``max_radius_km=None`` derives the
+        ``min_radius_km`` defaults to 0 km. ``max_radius_km=None`` derives the
         outer radius from ``magnitude``; a finite positive value is a direct
         user override. Resolved values are converted to the angular radii
         required by the FDSN station service and are also enforced against the
@@ -751,6 +771,10 @@ def get_mseed_stationxml(
         completeness, continuous common coverage of the requested interval and
         availability of a response for every retained trace. An incomplete or
         incompatible pair is downloaded again automatically.
+    processing_window
+        Optional resolved observation-window settings, as supplied by
+        :func:`run_auto_cmt`. Widen each request to cover the processed
+        samples and the reserved reference-time and correlation margins.
 
     Returns
     -------
@@ -990,6 +1014,7 @@ def get_mseed_stationxml(
             "location": location,
             "location_label": location_label,
             "channel_prefix": row.channel_prefix,
+            "channel_priority_rank": int(row.priority),
             "component_scheme": row.component_scheme,
             "selected_channels": row.selected_channels,
             "channels": row.channels,
@@ -1062,6 +1087,17 @@ def get_mseed_stationxml(
 
         request_start = origin + p_time - before_p
         request_end = origin + s_time + after_s
+        if processing_window is not None:
+            try:
+                geometry = _station_window_geometry(base, **processing_window)
+            except ValueError as exc:
+                log_rows.append({
+                    **base, "status": "invalid_processing_window",
+                    "reason": str(exc), "cache_reason": "not_checked",
+                })
+                continue
+            request_start = min(request_start, origin + geometry["window_start_offset_s"])
+            request_end = max(request_end, origin + geometry["window_end_offset_s"])
 
         # FDSN request boundaries are arbitrary UTC times, while miniSEED samples lie
         # on a discrete station-specific sample grid. Request two extra samples on
@@ -1457,24 +1493,15 @@ def process_mseed_sac(
     pad_missing_prearrival = bool(pad_missing_prearrival)
 
     _validate_processing_parameters(freqmin, freqmax, corners, dt)
-    phases = {
-        "window_start_phase": _normalize_phase(
-            window_start_phase, "window_start_phase"
-        ),
-        "window_end_phase": _normalize_phase(
-            window_end_phase, "window_end_phase"
-        ),
-    }
-    _validate_window_parameters(
+    geometry_settings = _observation_window_settings(
+        dt=dt, freqmax=freqmax,
+        window_start_phase=window_start_phase, window_end_phase=window_end_phase,
         time_before_window_start=time_before_window_start,
         time_after_window_end=time_after_window_end,
         inversion_duration=inversion_duration,
         max_correlation_shift=max_correlation_shift,
         max_reference_time_shift=max_reference_time_shift,
-        freqmax=freqmax,
-        dt=dt,
         reduction_velocity_km_s=reduction_velocity_km_s,
-        phases=phases.values(),
     )
 
     root = Path(output_dir).expanduser()
@@ -1488,18 +1515,7 @@ def process_mseed_sac(
     station_rows: list[dict[str, Any]] = []
     log_rows: list[dict[str, Any]] = []
 
-    window_settings = {
-        **phases,
-        "time_before_window_start": float(time_before_window_start),
-        "time_after_window_end": float(time_after_window_end),
-        "inversion_duration": (
-            None if inversion_duration is None else float(inversion_duration)
-        ),
-        "max_correlation_shift": float(max_correlation_shift),
-        "max_reference_time_shift": float(max_reference_time_shift),
-        "pad_missing_prearrival": pad_missing_prearrival,
-        "reduction_velocity_km_s": float(reduction_velocity_km_s),
-    }
+    window_settings = {**geometry_settings, "pad_missing_prearrival": pad_missing_prearrival}
 
     for row in station_df.itertuples(index=False):
         row_dict = row._asdict()
@@ -1527,20 +1543,7 @@ def process_mseed_sac(
                 )
 
             distance_km = float(row_dict["distance_km"])
-            geometry = _station_window_geometry(
-                row_dict,
-                dt=float(dt),
-                window_start_phase=phases["window_start_phase"],
-                time_before_window_start=float(time_before_window_start),
-                window_end_phase=phases["window_end_phase"],
-                time_after_window_end=float(time_after_window_end),
-                inversion_duration=(
-                    None if inversion_duration is None else float(inversion_duration)
-                ),
-                max_correlation_shift=float(max_correlation_shift),
-                max_reference_time_shift=float(max_reference_time_shift),
-                reduction_velocity_km_s=float(reduction_velocity_km_s),
-            )
+            geometry = _station_window_geometry(row_dict, dt=float(dt), **geometry_settings)
             target_start = origin + geometry["window_start_offset_s"]
             target_end = origin + geometry["window_end_offset_s"]
             target_times = (
@@ -3447,7 +3450,7 @@ def generate_syngine_gfs(
                             "filter_guard_s": filter_guard_s,
                             "request_end_s": request_end_s,
                             "request_padding_s": request_padding_s,
-                            "reference_moment_Nm": _SYNGINE_MTTIME_REFERENCE_MOMENT_NM,
+                            "reference_moment_Nm": _MTTIME_REFERENCE_MOMENT_NM,
                             "amplitude_scale": _SYNGINE_MTTIME_AMPLITUDE_SCALE,
                             "origin_ts": origin_ts,
                             "correlation_max_shift_samples": max_shift_samples,
@@ -3565,7 +3568,7 @@ def generate_syngine_gfs(
                             "filter_guard_s": filter_guard_s,
                             "request_end_s": job["request_end_s"],
                             "request_padding_s": request_padding_s,
-                            "reference_moment_Nm": _SYNGINE_MTTIME_REFERENCE_MOMENT_NM,
+                            "reference_moment_Nm": _MTTIME_REFERENCE_MOMENT_NM,
                             "amplitude_scale": _SYNGINE_MTTIME_AMPLITUDE_SCALE,
                             "origin_ts": job["origin_ts"],
                             "correlation_max_shift_samples": job["max_shift_samples"],
@@ -3674,8 +3677,9 @@ def write_mtinv(
         ``max_reference_time_shift``. For example, ``+5`` aligns Green's-function
         sample zero with the observed sample five seconds after catalog origin.
     drop_stations
-        Stations excluded only from this configuration. Entries may be complete
-        ``station_id`` strings or ``(network, station, location)`` tuples.
+        Stations excluded only from this configuration. Accepts ``NET.STA.LOC``
+        strings, ``(network, station, location)`` tuples, and unambiguous
+        ``STA`` or ``NET.STA`` strings. Selectors absent from the table are ignored.
 
     Returns
     -------
@@ -3718,21 +3722,12 @@ def write_mtinv(
         raise ValueError("station_df is empty.")
     if gf_manifest.empty:
         raise ValueError("gf_manifest is empty.")
-    _validate_station_depth_policy(station_df)
-
-    table = station_df.copy()
-    if "station_id" not in table:
-        table["station_id"] = table.apply(
-            lambda row: _station_id_from_row(row), axis=1
-        )
-    table["station_id"] = table["station_id"].astype(str)
-
-    dropped = {
-        _normalize_station_selector(value) for value in (drop_stations or [])
-    }
+    table = _station_id_table(station_df)
+    dropped = _resolve_station_drops(table["station_id"], drop_stations)
     table = table.loc[~table["station_id"].isin(dropped)].copy()
     if table.empty:
         raise ValueError("No stations remain after applying drop_stations.")
+    _validate_station_depth_policy(table)
 
     required_timing = {"ts", "origin_ts", "npts", "stored_npts", "dt"}
     missing_timing = required_timing.difference(table.columns)
@@ -3876,19 +3871,7 @@ def write_mtinv(
     table["stored_npts"] = stored_npts.to_numpy(dtype=np.int64)
     table["dt"] = numeric["dt"].to_numpy(dtype=float)
 
-    if depths_km is None:
-        depth_column = (
-            "requested_depth_km"
-            if "requested_depth_km" in gf_manifest
-            else "source_depth_km"
-        )
-        depths = sorted(gf_manifest[depth_column].astype(float).unique())
-    else:
-        depths = sorted({float(value) for value in depths_km})
-    if not depths or any(
-        not np.isfinite(value) or value <= 0 for value in depths
-    ):
-        raise ValueError("Trial depths must contain finite positive values.")
+    depths = _trial_depths(depths_km, gf_manifest)
 
     output_path = Path(output_file).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4029,6 +4012,9 @@ def run_mttime_inversion(
     correlate: bool = False,
     reference_time_shift: float = 0.0,
     drop_stations: Sequence[str | tuple[str, str, str]] | None = None,
+    azimuth_control: bool | Mapping[str, Any] | None = None,
+    station_jackknife: bool | Mapping[str, Any] | None = None,
+    channel_priority: Sequence[str] | None = None,
     results_dir: str | Path | None = None,
     figures_dir: str | Path | None = None,
     plot_views: Sequence[str] = ("waveform", "depth", "map", "lune", "cmt"),
@@ -4166,40 +4152,59 @@ def run_mttime_inversion(
     private execution layer before ``Inversion.invert()`` begins; this installs
     timing metadata without reading the SAC streams early or invoking MTtime's
     private data loader outside its normal lifecycle.
+
+    Set ``azimuth_control=True`` for eight 45-degree sectors, at least three
+    occupied sectors and four active stations, and at most two active stations
+    in each sector. A mapping overrides these defaults. Channel preference
+    (from acquisition metadata or ``channel_priority``), distance and station ID
+    resolve ties after manual drops and component masking.
+
+    Set ``station_jackknife=True`` to omit each active station and refit the
+    tested depth grid at the selected reference time. A mapping can set
+    ``jackknife_min_stations`` (4) and ``jackknife_opposing_station`` (False).
+    With opposing pairs enabled, all sufficiently opposing pairs are tested
+    instead of single stations. See the workflow guide for the tolerance.
+    Diagnostics are attached to ``inversion.station_selection`` and
+    ``inversion.station_jackknife`` and saved with the other result tables when
+    enabled.
     """
-    mtinv_stations = write_mtinv(
-        event_df,
-        station_df,
-        gf_manifest,
-        output_file=output_file,
-        path_to_data=path_to_data,
-        path_to_green=path_to_green,
-        depths_km=depths_km,
-        components=components,
-        degree=degree,
-        weight=weight,
-        plot=plot,
-        correlate=correlate,
-        reference_time_shift=reference_time_shift,
-        drop_stations=drop_stations,
+    return _run_inversion(
+        event_df, station_df, gf_manifest,
+        azimuth=_normalize_azimuth_control(azimuth_control),
+        jackknife=_normalize_jackknife(station_jackknife),
+        channel_priority=channel_priority,
+        mtinv_options=dict(
+            output_file=output_file, path_to_data=path_to_data, path_to_green=path_to_green,
+            depths_km=depths_km, components=components, degree=degree, weight=weight,
+            plot=plot, correlate=correlate, reference_time_shift=reference_time_shift,
+            drop_stations=drop_stations,
+        ),
+        output_options=dict(
+            results_dir=results_dir, figures_dir=figures_dir, plot_views=plot_views,
+            waveform_option=waveform_option, figure_format=figure_format, figure_dpi=figure_dpi,
+            show=show, write_option=write_option, save_tables=save_tables,
+            strict_plots=strict_plots, correlation_abs_max=correlation_abs_max,
+        ),
     )
 
-    mtinv_path = Path(output_file).expanduser().resolve()
+
+def _run_inversion(event_df, station_df, gf_manifest, *, mtinv_options, output_options,
+                   azimuth=None, jackknife=None, channel_priority=None, statistics=None):
+    selection = None
+    if mtinv_options["drop_stations"] or (azimuth is not None and azimuth["azimuth_selection"]):
+        station_df, selection = _select_inversion_stations(
+            station_df, mtinv_options["components"], mtinv_options["drop_stations"],
+            azimuth, channel_priority,
+        )
+        mtinv_options = {**mtinv_options, "drop_stations": None}
+    if jackknife is not None:
+        statistics = []
+    mtinv_stations = write_mtinv(event_df, station_df, gf_manifest, **mtinv_options)
+
+    mtinv_path = Path(mtinv_options["output_file"]).expanduser().resolve()
     inversion, solution_df, station_fit_df, output_manifest = _run_mttime_file(
-        mtinv_path,
-        timing_table=mtinv_stations,
-        degree=degree,
-        results_dir=results_dir,
-        figures_dir=figures_dir,
-        plot_views=plot_views,
-        waveform_option=waveform_option,
-        figure_format=figure_format,
-        figure_dpi=figure_dpi,
-        show=show,
-        write_option=write_option,
-        save_tables=save_tables,
-        strict_plots=strict_plots,
-        correlation_abs_max=correlation_abs_max,
+        mtinv_path, timing_table=mtinv_stations, degree=mtinv_options["degree"],
+        statistics=statistics, **output_options,
     )
 
     try:
@@ -4228,12 +4233,21 @@ def run_mttime_inversion(
         sort=False,
     )
 
+    output_dir = _resolve_output_directory(mtinv_path.parent, output_options["results_dir"], "results")
+    save_tables = output_options["save_tables"]
+    inversion.station_selection = selection
+    inversion.station_jackknife = None
+    if jackknife is not None:
+        full = solution_df.loc[solution_df["preferred"]].iloc[0]
+        inversion.station_jackknife = _station_jackknife(statistics, mtinv_stations, full, jackknife)
+    output_manifest = _write_station_diagnostics(
+        output_manifest, output_dir, save_tables, station_selection=selection,
+        station_jackknife=inversion.station_jackknife,
+    )
+
     if save_tables:
-        project_dir = mtinv_path.parent
-        result_root = _resolve_output_directory(project_dir, results_dir, "results")
-        result_root.mkdir(parents=True, exist_ok=True)
         output_manifest.to_csv(
-            result_root / "inversion_outputs.csv",
+            output_dir / "inversion_outputs.csv",
             index=False,
         )
 
@@ -4256,6 +4270,7 @@ def _run_mttime_file(
     save_tables: bool = True,
     strict_plots: bool = False,
     correlation_abs_max: bool = True,
+    statistics: list[_StationStatistics] | None = None,
 ) -> tuple[Any, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Execute one already-written MTtime configuration.
 
@@ -4328,7 +4343,15 @@ def _run_mttime_file(
         _install_bounded_origin_correlation(
             inversion, abs_max=bool(correlation_abs_max)
         )
-    inversion.invert()
+    if statistics is not None:
+        def collect(inv, depth):
+            statistics.append(_capture_station_statistics(inv, depth))
+
+        inversion._station_statistics_hook = collect
+    try:
+        inversion.invert()
+    finally:
+        inversion._station_statistics_hook = None
 
     if not inversion.moment_tensors:
         raise RuntimeError("MTtime completed without producing any moment-tensor solutions.")
@@ -4467,6 +4490,9 @@ def mttime_inversion_oshift(
     plot: bool = False,
     correlate: bool = False,
     drop_stations: Sequence[str | tuple[str, str, str]] | None = None,
+    azimuth_control: bool | Mapping[str, Any] | None = None,
+    station_jackknife: bool | Mapping[str, Any] | None = None,
+    channel_priority: Sequence[str] | None = None,
     plot_views: Sequence[str] = (),
     waveform_option: str | None = "preferred",
     figure_format: str = "png",
@@ -4525,6 +4551,13 @@ def mttime_inversion_oshift(
     on_error
         ``"raise"`` stops on the first failed shift. ``"record"`` stores the
         failure in ``summary_df`` and continues.
+    azimuth_control, channel_priority
+        Select one station set before evaluating any shift. Defaults and
+        ranking follow :func:`run_mttime_inversion`.
+    station_jackknife
+        When enabled, test each omission across the successful depth/shift
+        candidates. The single scan-level table is saved as
+        ``station_jackknife.csv`` and exposed as records in ``summary_df.attrs``.
 
     Returns
     -------
@@ -4579,13 +4612,16 @@ def mttime_inversion_oshift(
     if error_mode not in {"raise", "record"}:
         raise ValueError("on_error must be 'raise' or 'record'.")
 
-    shifts = np.asarray(list(reference_time_shifts), dtype=float)
-    if shifts.ndim != 1 or shifts.size == 0:
-        raise ValueError("reference_time_shifts must contain at least one value.")
-    if not np.isfinite(shifts).all():
-        raise ValueError("reference_time_shifts must contain only finite values.")
-    if np.unique(shifts).size != shifts.size:
-        raise ValueError("reference_time_shifts cannot contain duplicate values.")
+    shifts = _reference_shifts(reference_time_shifts)
+    if gf_manifest.empty:
+        raise ValueError("gf_manifest is empty.")
+    azimuth = _normalize_azimuth_control(azimuth_control)
+    jackknife = _normalize_jackknife(station_jackknife)
+    selection = None
+    if azimuth["azimuth_selection"] or drop_stations:
+        station_df, selection = _select_inversion_stations(
+            station_df, components, drop_stations, azimuth, channel_priority,
+        )
 
     root = Path(output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -4600,6 +4636,19 @@ def mttime_inversion_oshift(
     solution_tables: list[pd.DataFrame] = []
     fit_tables: list[pd.DataFrame] = []
     manifest_tables: list[pd.DataFrame] = []
+    statistics = []
+    fitted_stations = None
+    depths = _trial_depths(depths_km, gf_manifest)
+    mtinv_options = dict(
+        path_to_data=data_root, path_to_green=green_root, depths_km=depths,
+        components=components, degree=degree, weight=weight, plot=plot,
+        correlate=correlate, drop_stations=None,
+    )
+    output_options = dict(
+        plot_views=plot_views, waveform_option=waveform_option, figure_format=figure_format,
+        figure_dpi=figure_dpi, show=show, write_option=write_option, save_tables=save_tables,
+        strict_plots=strict_plots, correlation_abs_max=correlation_abs_max,
+    )
 
     iterator = tqdm(
         enumerate(shifts),
@@ -4617,6 +4666,7 @@ def mttime_inversion_oshift(
         figures_dir = run_dir / "figures"
         mtinv_path = run_dir / "mtinv.in"
         run_dir.mkdir(parents=True, exist_ok=True)
+        trial_statistics = None if jackknife is None else []
 
         try:
             with _suppressed_console_output(suppress_output):
@@ -4626,32 +4676,12 @@ def mttime_inversion_oshift(
                     run_solutions,
                     run_fits,
                     run_manifest,
-                ) = run_mttime_inversion(
-                    event_df,
-                    station_df,
-                    gf_manifest,
-                    output_file=mtinv_path,
-                    path_to_data=data_root,
-                    path_to_green=green_root,
-                    depths_km=depths_km,
-                    components=components,
-                    degree=degree,
-                    weight=weight,
-                    plot=plot,
-                    correlate=correlate,
-                    reference_time_shift=shift,
-                    drop_stations=drop_stations,
-                    results_dir=results_dir,
-                    figures_dir=figures_dir,
-                    plot_views=plot_views,
-                    waveform_option=waveform_option,
-                    figure_format=figure_format,
-                    figure_dpi=figure_dpi,
-                    show=show,
-                    write_option=write_option,
-                    save_tables=save_tables,
-                    strict_plots=strict_plots,
-                    correlation_abs_max=correlation_abs_max,
+                ) = _run_inversion(
+                    event_df, station_df, gf_manifest, statistics=trial_statistics,
+                    mtinv_options=dict(mtinv_options, output_file=mtinv_path,
+                                       reference_time_shift=shift),
+                    output_options=dict(output_options, results_dir=results_dir,
+                                        figures_dir=figures_dir),
                 )
 
             figure_tag = f"oshift_{run_index:03d}_{shift_token}"
@@ -4712,6 +4742,9 @@ def mttime_inversion_oshift(
                 run_manifest.insert(1, "reference_time_shift", shift)
                 manifest_tables.append(run_manifest)
 
+            if trial_statistics:
+                statistics.extend(trial_statistics)
+                fitted_stations = mtinv_stations
             del inversion
 
         except Exception as exc:
@@ -4753,6 +4786,7 @@ def mttime_inversion_oshift(
     summary_df["best_vr_across_shifts"] = False
     summary_df["vr_rank_across_shifts"] = np.nan
     summary_df["delta_vr_from_best"] = np.nan
+    jackknife_table = None
     if successful.any():
         successful_index = summary_df.index[successful]
         vr = pd.to_numeric(
@@ -4765,6 +4799,10 @@ def mttime_inversion_oshift(
             vr.rank(method="min", ascending=False).astype(int)
         )
         summary_df.loc[successful_index, "delta_vr_from_best"] = best_vr - vr
+        if jackknife is not None:
+            jackknife_table = _station_jackknife(
+                statistics, fitted_stations, summary_df.loc[best_index], jackknife,
+            )
     elif error_mode == "record":
         if save_tables:
             summary_df.to_csv(root / "origin_shift_summary.csv", index=False)
@@ -4775,6 +4813,11 @@ def mttime_inversion_oshift(
             f"{reason_text}"
         )
 
+    _set_scan_diagnostics(summary_df, station_selection=selection, station_jackknife=jackknife_table)
+    output_manifest = _write_station_diagnostics(
+        output_manifest, root, save_tables, station_selection=selection,
+        station_jackknife=jackknife_table,
+    )
     if save_tables:
         summary_df.to_csv(root / "origin_shift_summary.csv", index=False)
         solution_df.to_csv(root / "origin_shift_solutions.csv", index=False)
@@ -4783,6 +4826,402 @@ def mttime_inversion_oshift(
 
     return summary_df, solution_df, station_fit_df, output_manifest
 
+
+def run_auto_cmt(
+    event_id: str,
+    origin_time,
+    event_lon: float,
+    event_lat: float,
+    event_depth_km: float,
+    magnitude: float | None = None,
+    *,
+    output_dir: str | Path,
+    gf_source: str = "pyfk",
+    velocity_model=None,
+    gf_options: Mapping[str, Any] | None = None,
+    depths_km: Sequence[float] | None = None,
+    waveform_source: str = "fdsn",
+    station_df: pd.DataFrame | str | Path | None = None,
+    client: str | Sequence[str | Any] | Any = "GEONET",
+    min_radius_km: float = 0.0,
+    max_radius_km: float | None = None,
+    radius_scale_factor: float = 1.66,
+    ground_level: bool = True,
+    channels: Sequence[str] = ("HH?", "BH?", "LH?"),
+    channel_priority: Sequence[str] | None = None,
+    taup_model: str = "iasp91",
+    before_p: float = 60.0,
+    after_s: float = 300.0,
+    overwrite_waveforms: bool = False,
+    motion: str = "DISP",
+    freqmin: float = 0.02,
+    freqmax: float = 0.05,
+    dt: float = 1.0,
+    processing_options: Mapping[str, Any] | None = None,
+    reference_time_shifts: Sequence[float] | None = None,
+    components: str = "ZRT",
+    degree: int = 5,
+    weight: str = "none",
+    correlate: bool = False,
+    drop_stations: Sequence[str | tuple[str, str, str]] | None = None,
+    azimuth_control: bool | Mapping[str, Any] | None = None,
+    station_jackknife: bool | Mapping[str, Any] | None = None,
+    plot: bool = False,
+    show: bool = False,
+    inversion_options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Acquire, prepare and invert one event with MTtime at a fixed epicentre.
+
+    ``output_dir`` is the root for this event. The FDSN path uses
+    :func:`get_mseed_stationxml`, including its validated raw-data cache.
+    Set ``waveform_source="local"`` and provide the downloaded-station
+    table or its CSV to process existing miniSEED and StationXML. Local tables
+    must describe the supplied event and retain the acquisition fields.
+
+    With ``gf_source="pyfk"``, supply the layered DataFrame or VelocityGrid3D
+    accepted by :func:`generate_pyfk_gfs`. For ``"syngine"``, pass service
+    options accepted by :func:`generate_syngine_gfs`. In both cases the
+    default trial depth is the supplied event depth.
+
+    With ``gf_source="custom"``, ``gf_options`` takes ``manifest`` (a DataFrame
+    or CSV) and optionally ``path_to_green``. If omitted, the common directory
+    is inferred from the manifest's ``path`` column. Inputs are final MTtime
+    SAC tensor or Herrmann files with the requested motion, units, band,
+    sample interval and per-station length. Depths default to the manifest.
+    See the workflow guide for the custom GF format and an SW4 example.
+
+    For FDSN acquisition ``channel_priority`` defaults to ``HH, BH, LH``.
+    Local tables reuse their recorded channel ranks unless explicitly overridden.
+
+    ``processing_options`` forwards extra :func:`process_mseed_sac`` options.
+    ``inversion_options`` forwards extra options for the selected inversion
+    function, including ``save_tables`` and ``plot_views``. A supplied
+    ``reference_time_shifts`` sequence searches those shifts and the supplied
+    depths together. Without it the inversion uses the supplied origin.
+    The processing margin defaults to the largest absolute requested shift.
+
+    The returned mapping includes the preferred solution and full tables,
+    station selection/jackknife, exact configured station IDs, output
+    manifest, acquisition and processing logs, and GF metadata. The
+    shift-scan path additionally returns the per-shift summary table.
+    """
+    from obspy import UTCDateTime
+
+    source = str(gf_source).lower()
+    if source not in {"pyfk", "syngine", "custom"}:
+        raise ValueError("gf_source must be 'pyfk', 'syngine' or 'custom'.")
+    waveform_source = str(waveform_source).lower()
+    if waveform_source not in {"fdsn", "local"}:
+        raise ValueError("waveform_source must be 'fdsn' or 'local'.")
+    if (waveform_source == "local") != (station_df is not None):
+        raise ValueError("Supply station_df with waveform_source='local'.")
+    if source == "pyfk" and velocity_model is None:
+        raise ValueError("gf_source='pyfk' requires velocity_model.")
+    if source != "pyfk" and velocity_model is not None:
+        raise ValueError("velocity_model is used only with gf_source='pyfk'.")
+
+    _resolve_mtinv_components(components)
+    if degree not in {5, 6}:
+        raise ValueError("degree must be 5 or 6.")
+    if str(weight).lower() not in {"none", "distance", "variance"}:
+        raise ValueError("weight must be 'none', 'distance' or 'variance'.")
+    motion = _normalize_motion_name(motion, "motion")
+    azimuth = _normalize_azimuth_control(azimuth_control)
+    _normalize_jackknife(station_jackknife)
+    shifts = None if reference_time_shifts is None else _reference_shifts(reference_time_shifts)
+    processing = dict(processing_options or {})
+    processing.update(motion=motion, freqmin=freqmin, freqmax=freqmax, dt=dt)
+    _validate_processing_parameters(freqmin, freqmax, processing.get("corners", 3), dt)
+    if shifts is not None:
+        interval = float(processing["dt"])
+        shift_samples = shifts / interval
+        if not np.allclose(shift_samples, np.rint(shift_samples), atol=1e-8, rtol=0.0):
+            raise ValueError("Every reference_time_shift must be an integer multiple of dt.")
+        required = float(np.abs(shifts).max())
+        if float(processing.setdefault("max_reference_time_shift", required)) < required - 1e-8:
+            raise ValueError(f"Processing must reserve max_reference_time_shift >= {required:g} s.")
+    if not correlate:
+        processing.setdefault("max_correlation_shift", 0.0)
+    elif float(processing.get("max_correlation_shift", 5.0)) <= 0.0:
+        raise ValueError("correlate=True requires a positive max_correlation_shift.")
+    window_fields = (
+        "window_start_phase", "time_before_window_start", "window_end_phase",
+        "time_after_window_end", "inversion_duration", "max_correlation_shift",
+        "max_reference_time_shift", "reduction_velocity_km_s",
+    )
+    processing_window = _observation_window_settings(
+        dt=dt, freqmax=freqmax,
+        **{key: processing[key] for key in window_fields if key in processing},
+    )
+
+    root = Path(output_dir).expanduser().resolve()
+    event_id = str(event_id).strip()
+    if not event_id:
+        raise ValueError("event_id cannot be empty.")
+    event = {
+        "event_id": event_id, "origin_time": str(UTCDateTime(origin_time)),
+        "event_lon": float(event_lon), "event_lat": float(event_lat),
+        "event_depth_km": float(event_depth_km), "magnitude": magnitude,
+    }
+    if not (-180 <= event["event_lon"] <= 180 and -90 <= event["event_lat"] <= 90
+            and np.isfinite(event["event_depth_km"]) and event["event_depth_km"] >= 0):
+        raise ValueError("Supply finite event coordinates and a non-negative depth.")
+    event_path = root / "metadata" / "event.csv"
+    if event_path.is_file():
+        existing = pd.read_csv(event_path, usecols=["event_id"], dtype=str)["event_id"]
+        if not existing.eq(event_id).all():
+            raise ValueError(f"{root} contains a different event. Choose an output_dir for {event_id}.")
+    inversion_kwargs = dict(
+        components=components, degree=degree, weight=weight, correlate=correlate,
+        station_jackknife=station_jackknife, show=show,
+        plot_views=("waveform", "depth", "cmt") if plot else (),
+    )
+    extra = dict(inversion_options or {})
+    allowed = {
+        "plot_views", "waveform_option", "figure_format", "figure_dpi",
+        "write_option", "save_tables", "strict_plots", "correlation_abs_max",
+    }
+    if shifts is not None:
+        allowed.update(("progress", "suppress_output", "on_error"))
+    unknown = extra.keys() - allowed
+    if unknown:
+        raise ValueError(f"Unsupported inversion_options: {sorted(unknown)}.")
+    inversion_kwargs.update(extra)
+    options = dict(gf_options or {})
+    model_manifest = None
+    if source == "custom":
+        gf_manifest, green_root = _load_custom_gfs(options)
+        depths = _trial_depths(depths_km, gf_manifest)
+    else:
+        green_root = root / "greens"
+        depths = _trial_depths([event_depth_km] if depths_km is None else depths_km)
+        supplied = options.keys() & {"depths_km", "output_dir", "motion", "freqmin", "freqmax", "corners", "dt"}
+        if supplied:
+            raise ValueError(f"Use run_auto_cmt settings for {sorted(supplied)}.")
+
+    if waveform_source == "fdsn":
+        event_df, raw_stations, download_log = get_mseed_stationxml(
+            event_id, origin_time, event_lon, event_lat, event_depth_km,
+            magnitude=magnitude, output_dir=root, client=client, min_radius_km=min_radius_km,
+            max_radius_km=max_radius_km, radius_scale_factor=radius_scale_factor,
+            ground_level=ground_level, channels=channels,
+            channel_priority=("HH", "BH", "LH") if channel_priority is None else channel_priority,
+            taup_model=taup_model, before_p=before_p, after_s=after_s,
+            overwrite=overwrite_waveforms, processing_window=dict(processing_window, dt=dt),
+        )
+    else:
+        event_df = pd.DataFrame([event])
+        raw_stations = _read_workflow_table(station_df, ("waveform_path", "stationxml_path"))
+        _validate_local_event(raw_stations, event)
+        download_log = pd.DataFrame()
+
+    if waveform_source == "local" and raw_stations.empty:
+        raise ValueError("The local downloaded-station table is empty.")
+    if raw_stations.empty:
+        raise ValueError(f"No usable waveform downloads. See {root / 'metadata' / 'download_log.csv'}.")
+    _, processed, processing_log = process_mseed_sac(event_df, raw_stations, output_dir=root, **processing)
+    if waveform_source == "local":
+        event_df.to_csv(event_path, index=False)
+    if processed.empty:
+        raise ValueError(f"No stations passed processing. See {root / 'metadata' / 'processing_log.csv'}.")
+    selected, selection = _select_inversion_stations(
+        processed, components, drop_stations, azimuth, channel_priority,
+    )
+    if source == "pyfk":
+        gf_manifest, model_manifest = generate_pyfk_gfs(
+            event_df, selected, velocity_model, depths_km=depths, output_dir=root, **options,
+        )
+    elif source == "syngine":
+        gf_manifest = generate_syngine_gfs(event_df, selected, depths_km=depths, output_dir=root, **options)
+    else:
+        _validate_custom_gf_metadata(gf_manifest, event, selected, depths, green_root)
+        gf_manifest.to_csv(root / "metadata" / "gf_manifest.csv", index=False)
+
+    inversion_kwargs.update(
+        path_to_data=root / "processed" / "data", path_to_green=green_root,
+        depths_km=depths,
+    )
+
+    metadata = root / "metadata"
+    shift_summary = None
+    inversion = None
+    mtinv_stations = None
+    if shifts is None:
+        mtinv_stations, inversion, solutions, fits, outputs = run_mttime_inversion(
+            event_df, selected, gf_manifest, output_file=root / "mtinv.in", **inversion_kwargs,
+        )
+        summary = solutions.loc[solutions["preferred"]].copy()
+        jackknife = inversion.station_jackknife
+        inversion.station_selection = selection
+    else:
+        shift_summary, solutions, fits, outputs = mttime_inversion_oshift(
+            event_df, selected, gf_manifest, output_dir=root / "origin_shifts",
+            reference_time_shifts=shifts, **inversion_kwargs,
+        )
+        summary = shift_summary.loc[shift_summary["best_vr_across_shifts"]].copy()
+        records = shift_summary.attrs["station_jackknife"]
+        jackknife = None if records is None else pd.DataFrame.from_records(records)
+        _set_scan_diagnostics(shift_summary, station_selection=selection)
+    preferred = summary.iloc[0]
+    fit_mask = fits["depth_km"].eq(preferred["depth_km"])
+    if shifts is not None:
+        fit_mask &= fits["run_index"].eq(preferred["run_index"])
+    fit = fits.loc[fit_mask].copy()
+    save_tables = inversion_kwargs.get("save_tables", True)
+    outputs = _write_station_diagnostics(outputs, metadata, save_tables, station_selection=selection)
+    if save_tables:
+        name = "results/inversion_outputs.csv" if shifts is None else "origin_shifts/origin_shift_outputs.csv"
+        outputs.to_csv(root / name, index=False)
+    result = {
+        "summary": summary.reset_index(drop=True),
+        "solutions": solutions, "station_fit": fit, "station_fits": fits,
+        "origin_shift_summary": shift_summary, "station_jackknife": jackknife,
+    }
+    return {
+        "output_dir": root, "event_df": event_df, "raw_stations": raw_stations,
+        "processed_stations": processed, "station_df": selected,
+        "mtinv_stations": mtinv_stations, "inversion": inversion,
+        "download_log": download_log, "processing_log": processing_log,
+        "station_selection": selection, "station_jackknife": jackknife,
+        "gf_source": source, "gf_manifest": gf_manifest, "gf_model_manifest": model_manifest,
+        "path_to_green": green_root, "depths_km": depths, "results": result,
+        "output_manifest": outputs,
+    }
+
+
+def _reference_shifts(values):
+    shifts = np.asarray(list(values), dtype=float)
+    if shifts.ndim != 1 or shifts.size == 0 or not np.isfinite(shifts).all():
+        raise ValueError("reference_time_shifts must contain at least one finite value.")
+    if np.unique(shifts).size != shifts.size:
+        raise ValueError("reference_time_shifts cannot contain duplicate values.")
+    return shifts
+
+
+def _trial_depths(values, manifest=None):
+    if values is None:
+        column = "requested_depth_km" if "requested_depth_km" in manifest else "source_depth_km"
+        values = manifest[column]
+    depths = sorted({float(value) for value in values})
+    if not depths or any(not np.isfinite(value) or value <= 0.0 for value in depths):
+        raise ValueError("Trial depths must contain finite positive values.")
+    if len({f"{depth:.4f}" for depth in depths}) != len(depths):
+        raise ValueError("Trial depths must have distinct four-decimal MTtime filenames.")
+    if float(f"{depths[0]:.4f}") <= 0:
+        raise ValueError("Trial depths must remain positive at the MTtime file precision of 0.0001 km.")
+    return depths
+
+
+def _read_workflow_table(value, path_columns):
+    if isinstance(value, pd.DataFrame):
+        return value.copy()
+    path = Path(value).expanduser().resolve()
+    table = pd.read_csv(
+        path, keep_default_na=False, na_values=["", "nan", "NaN"],
+        dtype={key: str for key in ("event_id", "station_id", "network", "station", "location", "used")},
+    )
+    if "location" in table:
+        table["location"] = table["location"].fillna("")
+    for column in path_columns:
+        if column in table:
+            table[column] = table[column].map(
+                lambda item: os.path.abspath(_resolve_from_config(path.parent, Path(item).expanduser())),
+                na_action="ignore",
+            )
+    return table
+
+
+def _validate_local_event(stations, event):
+    """Detect accidentally reused raw tables from another event or origin."""
+    from obspy import UTCDateTime
+
+    if "event_id" in stations and not stations["event_id"].astype(str).eq(event["event_id"]).all():
+        raise ValueError("The local station table belongs to a different event_id.")
+    if "origin_time" in stations:
+        origin = UTCDateTime(event["origin_time"])
+        if not stations["origin_time"].map(lambda value: abs(UTCDateTime(value) - origin) <= 1e-6).all():
+            raise ValueError("The local station table uses a different origin_time. Recompute its geometry and arrivals.")
+    for name in ("event_lon", "event_lat", "event_depth_km"):
+        if name in stations and not np.allclose(
+            stations[name].to_numpy(float), event[name], atol=1e-6, rtol=0.0,
+        ):
+            raise ValueError(f"The local station table has a different {name}. Recompute its geometry and arrivals.")
+
+
+def _load_custom_gfs(options):
+    allowed = {"manifest", "path_to_green"}
+    if "manifest" not in options or set(options).difference(allowed):
+        raise ValueError("Custom gf_options requires 'manifest' and accepts 'path_to_green'.")
+    explicit = options.get("path_to_green")
+    manifest = _read_workflow_table(options["manifest"], ("path",) if explicit is None else ())
+    required = {"station_id", "basis", "motion", "units", "freqmin", "freqmax"}
+    missing = required.difference(manifest)
+    if not {"requested_depth_km", "source_depth_km"}.intersection(manifest):
+        missing.add("requested_depth_km or source_depth_km")
+    if missing:
+        raise ValueError(f"Custom GF manifest is missing columns: {sorted(missing)}.")
+    if manifest.empty:
+        raise ValueError("The custom GF manifest is empty.")
+    _green_format_from_manifest(manifest)
+    if explicit is not None:
+        root = Path(explicit).expanduser()
+        if not isinstance(options["manifest"], pd.DataFrame):
+            root = _resolve_from_config(Path(options["manifest"]).expanduser().resolve().parent, root)
+        return manifest, root.resolve()
+    if ("path" not in manifest or manifest["path"].isna().any()
+            or manifest["path"].astype(str).str.strip().eq("").any()):
+        raise ValueError("Supply gf_options['path_to_green'] or a complete GF manifest path column.")
+    parents = {Path(value).expanduser().parent.resolve() for value in manifest["path"]}
+    if len(parents) != 1:
+        raise ValueError("Custom MTtime Green's functions must share one directory.")
+    return manifest, parents.pop()
+
+
+def _validate_custom_gf_metadata(manifest, event, stations, depths, green_root):
+    """Check custom GF metadata against the selected observation contract."""
+    settings = _gf_processing_settings(stations)
+    depth_col = "requested_depth_km" if "requested_depth_km" in manifest else "source_depth_km"
+    matches = np.isin(manifest[depth_col].astype(float).map(lambda value: f"{value:.4f}"),
+                      [f"{depth:.4f}" for depth in depths])
+    used = manifest.loc[matches & manifest["station_id"].astype(str).isin(stations["station_id"])]
+    if used.empty:
+        raise ValueError("The custom GF manifest contains no requested station and depth combinations.")
+    for name in ("motion", "units"):
+        if not used[name].astype(str).str.strip().str.lower().eq(settings[name].lower()).all():
+            raise ValueError(f"Custom GF {name} must match the processed observations ({settings[name]}).")
+    for name in ("freqmin", "freqmax", "corners"):
+        if name in used and not np.allclose(used[name].to_numpy(float), settings[name], atol=1e-8, rtol=1e-6):
+            raise ValueError(f"Custom GF {name} must match the processed observations ({settings[name]}).")
+    for name in ("event_lon", "event_lat"):
+        if name in used and not np.allclose(used[name].to_numpy(float), event[name], atol=1e-6, rtol=0.0):
+            raise ValueError(f"Custom GF {name} must match the supplied epicentre.")
+    if {"distance_km", "azimuth_deg"}.intersection(used):
+        indices = used["station_id"].astype(str)
+        for name, aliases, tolerance in [
+            ("distance_km", ("distance", "distance_km"), 0.01),
+            ("azimuth_deg", ("azimuth", "azimuth_deg"), 1e-3),
+        ]:
+            if name not in used:
+                continue
+            lookup = pd.Series(_column_from_aliases(stations, aliases), index=stations["station_id"])
+            difference = used[name].to_numpy(float) - indices.map(lookup).to_numpy(float)
+            if name == "azimuth_deg":
+                difference = (difference + 180.0) % 360.0 - 180.0
+            bad = ~np.isfinite(difference) | (np.abs(difference) > tolerance)
+            if bad.any():
+                raise ValueError(f"Custom GF {name} differs from the observation geometry for {indices[bad].unique().tolist()}.")
+    for name in ("reference_moment_nm", "reference_moment_Nm"):
+        if name in used and not np.allclose(
+            used[name].to_numpy(float), _MTTIME_REFERENCE_MOMENT_NM, atol=0.0, rtol=1e-6,
+        ):
+            raise ValueError("Custom GF amplitudes must be referenced to 1e13 N m (1e20 dyne-cm).")
+    filenames = (used["station_id"].astype(str) + "."
+                 + used[depth_col].astype(float).map(lambda value: f"{value:.4f}")
+                 + "." + used["basis"].astype(str))
+    if filenames.duplicated().any():
+        raise ValueError("Custom GF manifest contains duplicate station, depth and basis rows.")
+    if "path" in used and not filenames.eq(used["path"].astype(str).map(lambda path: Path(path).name)).all():
+        raise ValueError(f"Custom GF manifest must name native MTtime files in {green_root}.")
 
 
 def _maximum_azimuth_gap_deg(azimuth_rad: Sequence[float]) -> float:
@@ -4799,16 +5238,7 @@ def _station_polar_table(station_df: pd.DataFrame) -> pd.DataFrame:
     """Return unique station IDs with event-centred radius and azimuth."""
     if station_df.empty:
         raise ValueError("station_df is empty.")
-    table = station_df.copy()
-    if "station_id" not in table.columns:
-        table["station_id"] = table.apply(
-            lambda row: _station_id_from_row(row), axis=1
-        )
-    if table["station_id"].astype(str).duplicated().any():
-        duplicate = table.loc[
-            table["station_id"].astype(str).duplicated(keep=False), "station_id"
-        ].astype(str).tolist()
-        raise ValueError(f"station_df contains duplicate station IDs: {duplicate}")
+    table = _station_id_table(station_df)
 
     if "r_epi" in table.columns:
         radius = pd.to_numeric(table["r_epi"], errors="raise").to_numpy(float)
@@ -4837,6 +5267,321 @@ def _station_polar_table(station_df: pd.DataFrame) -> pd.DataFrame:
         "r_epi": radius,
         "r_azi": np.mod(azimuth, 2.0 * np.pi),
     })
+
+
+def _station_option(value, defaults, name):
+    """Resolve a boolean or a mapping of overrides for a station control."""
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        return dict(defaults) if value else None
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{name} must be None, a boolean or a mapping.")
+    unknown = sorted(set(value).difference(defaults), key=str)
+    if unknown:
+        raise ValueError(f"Unknown {name} option(s): {unknown}.")
+    return {**defaults, **value}
+
+
+def _positive_integer(value, name):
+    if (isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer)) or value < 1):
+        raise ValueError(f"{name} must be a positive integer.")
+    return int(value)
+
+
+def _normalize_azimuth_control(value):
+    settings = _station_option(value, _AZIMUTH_CONTROL_DEFAULTS, "azimuth_control")
+    if settings is None:
+        return {**_AZIMUTH_CONTROL_DEFAULTS, "azimuth_selection": False}
+    if not isinstance(settings["azimuth_selection"], (bool, np.bool_)):
+        raise TypeError("azimuth_selection must be a boolean.")
+    for key in ("azimuth_min_sectors", "azimuth_max_stations_per_sector", "minimum_stations"):
+        settings[key] = _positive_integer(settings[key], key)
+    if settings["azimuth_min_sectors"] > 8:
+        raise ValueError("azimuth_min_sectors cannot exceed eight 45-degree sectors.")
+    return settings
+
+
+def _normalize_jackknife(value):
+    settings = _station_option(value, _JACKKNIFE_DEFAULTS, "station_jackknife")
+    if settings is not None:
+        key = "jackknife_min_stations"
+        settings[key] = _positive_integer(settings[key], key)
+        if not isinstance(settings["jackknife_opposing_station"], (bool, np.bool_)):
+            raise TypeError("jackknife_opposing_station must be a boolean.")
+        tolerance = float(settings["jackknife_opposition_tolerance_deg"])
+        if not np.isfinite(tolerance) or not 0.0 <= tolerance <= 180.0:
+            raise ValueError("jackknife_opposition_tolerance_deg must lie within [0, 180].")
+        settings["jackknife_opposition_tolerance_deg"] = tolerance
+    return settings
+
+
+def _station_id_table(station_df):
+    table = station_df.reset_index(drop=True).copy()
+    if "station_id" not in table:
+        table["station_id"] = table.apply(_station_id_from_row, axis=1)
+    if table["station_id"].isna().any():
+        raise ValueError("station_df contains missing station IDs.")
+    table["station_id"] = table["station_id"].astype(str)
+    duplicates = table.loc[table["station_id"].duplicated(keep=False), "station_id"].unique()
+    if len(duplicates):
+        raise ValueError(f"station_df contains duplicate station IDs: {duplicates.tolist()}.")
+    return table
+
+
+def _resolve_station_drops(station_ids, selectors, *, strict=False):
+    """Resolve exact IDs and unambiguous STA or NET.STA shorthand."""
+    if isinstance(selectors, str):
+        selectors = [selectors]
+    ids = set(station_ids)
+    dropped = set()
+    for selector in (() if selectors is None else selectors):
+        spec = _normalize_station_selector(selector).strip()
+        if spec in ids:
+            dropped.add(spec)
+            continue
+        parts = spec.split(".")
+        if len(parts) == 3 and not parts[2]:
+            matches = [spec + "--"] if spec + "--" in ids else []
+        elif len(parts) == 1 and spec:
+            matches = [sid for sid in ids if sid.count(".") == 2 and sid.split(".")[1] == spec]
+        elif len(parts) == 2:
+            matches = [sid for sid in ids if sid.rsplit(".", 1)[0] == spec]
+        else:
+            matches = []
+        if strict and not matches:
+            raise ValueError(f"Station selector {spec!r} is absent from station_df.")
+        if len(matches) > 1:
+            raise ValueError(f"drop_stations selector {spec!r} is ambiguous: {sorted(matches)}. Use NET.STA.LOC.")
+        dropped.update(matches)
+    return dropped
+
+
+def _select_inversion_stations(station_df, components, drop_stations, azimuth, channel_priority):
+    """Apply manual drops and sector thinning once, keeping prediction-only rows."""
+    if station_df.empty:
+        raise ValueError("station_df is empty.")
+    table = _station_id_table(station_df)
+    dropped = table["station_id"].isin(_resolve_station_drops(table["station_id"], drop_stations))
+    header, mask = _resolve_mtinv_components(components)
+    mask = mask or ("100" if header == "Z" else "111")
+    used = table["used"].map(lambda value: _intersect_used_mask(value, mask))
+    active = ~dropped & (used != "000")
+    audit = table[["station_id"]].copy()
+    audit["used_components"] = used.map(
+        lambda value: "".join(c for c, flag in zip("ZRT", value) if flag == "1")
+    )
+    audit["selection_status"] = np.select(
+        [dropped, active], ["manual_drop", "selected"], default="prediction_only",
+    )
+    audit["selection_reason"] = np.select(
+        [dropped, active], ["drop_stations", ""], default="no active components",
+    )
+    audit["distance_km"] = pd.to_numeric(_column_from_aliases(table, ("distance", "distance_km")), errors="coerce")
+    audit["azimuth_deg"] = pd.to_numeric(_column_from_aliases(table, ("azimuth", "azimuth_deg")), errors="coerce")
+    audit["azimuth_sector"] = (audit["azimuth_deg"] % 360 // 45).astype("Int64")
+
+    prefix = table.get("channel_prefix", pd.Series("", index=table.index)).fillna("").astype(str).str.strip().str.upper()
+    priority = ("HH", "BH", "HN", "BN", "LH") if channel_priority is None else channel_priority
+    ranks = {str(value).upper(): index for index, value in enumerate(priority)}
+    rank = prefix.map(ranks).fillna(len(ranks))
+    if channel_priority is None and "channel_priority_rank" in table:
+        rank = pd.to_numeric(table["channel_priority_rank"], errors="coerce").fillna(rank)
+    audit["channel_prefix"] = prefix
+    audit["channel_priority_rank"] = rank
+
+    candidates = audit.loc[active].copy()
+    if candidates.empty:
+        raise ValueError("No active stations remain after manual drops and component masking.")
+    sector_cap = azimuth["azimuth_max_stations_per_sector"]
+    if azimuth["azimuth_selection"]:
+        if not np.isfinite(candidates[["distance_km", "azimuth_deg"]].to_numpy(dtype=float)).all():
+            raise ValueError("Azimuth control requires finite station distances and azimuths.")
+        ordered = candidates.sort_values(["channel_priority_rank", "distance_km", "station_id"])
+        retained = ordered.groupby("azimuth_sector").head(sector_cap).index
+        excluded = candidates.index.difference(retained)
+        audit.loc[excluded, "selection_status"] = "azimuth_excluded"
+        audit.loc[excluded, "selection_reason"] = f"sector cap of {sector_cap} active stations"
+        selected = candidates.loc[retained]
+        sectors = selected["azimuth_sector"].nunique()
+        if len(selected) < azimuth["minimum_stations"] or sectors < azimuth["azimuth_min_sectors"]:
+            raise ValueError(
+                f"Azimuth control retained {len(selected)} active stations in {sectors} occupied sectors. "
+                f"Require {azimuth['minimum_stations']} stations and {azimuth['azimuth_min_sectors']} sectors."
+            )
+
+    active_azimuths = audit.loc[audit["selection_status"].eq("selected"), "azimuth_deg"]
+    audit["selected_azimuthal_gap_deg"] = _maximum_azimuth_gap_deg(np.deg2rad(active_azimuths.to_numpy(float)))
+    accepted = audit["selection_status"].isin(["selected", "prediction_only"])
+    return table.loc[accepted].reset_index(drop=True), audit
+
+
+def _write_station_diagnostics(manifest, root, save_tables, **tables):
+    rows = []
+    if save_tables:
+        for name, table in tables.items():
+            if table is not None:
+                path = root / f"{name}.csv"
+                table.to_csv(path, index=False)
+                rows.append(dict(kind="table", view=name, path=str(path), status="written", reason=""))
+    if not rows:
+        return manifest
+    if "run_index" in manifest:
+        manifest = manifest.astype({"run_index": "Int64"})
+    return pd.concat([manifest, pd.DataFrame(rows)], ignore_index=True)
+
+
+def _set_scan_diagnostics(summary, **tables):
+    # Keep pandas attrs comparable when combining summaries from several events.
+    for name, table in tables.items():
+        summary.attrs[name] = (
+            None if table is None
+            else table.astype(object).where(table.notna(), None).to_dict("records")
+        )
+
+
+class _StationStatistics(NamedTuple):
+    """Weighted normal equations by station for one solved depth and shift."""
+
+    depth_km: float
+    shift_s: float
+    normal: np.ndarray
+    rhs: np.ndarray
+    energy: np.ndarray
+    n_samples: np.ndarray
+    tensor_basis: np.ndarray
+    inversion_type: str
+
+
+def _capture_station_statistics(inversion, depth):
+    config = inversion.config
+    normal = np.zeros((config.nsta, config.degree, config.degree))
+    rhs = np.zeros((config.nsta, config.degree))
+    energy = np.zeros(config.nsta)
+    n_samples = np.zeros(config.nsta, dtype=int)
+    for index, (begin, end) in enumerate(zip(config.index1[:, 0], config.index2[:, -1])):
+        weights = inversion.w[begin:end]
+        active = weights != 0
+        design = inversion.G[begin:end][active]
+        observed = inversion.d[begin:end][active]
+        weights = weights[active]
+        normal[index] = design.T @ (weights[:, None] * design)
+        rhs[index] = design.T @ (weights * observed)
+        energy[index] = observed @ (weights * observed)
+        n_samples[index] = active.sum()
+    return _StationStatistics(
+        float(depth), float(inversion._reference_time_shift), normal, rhs, energy, n_samples,
+        np.array([inversion._a2m(unit) for unit in np.eye(config.degree)]) * 1e20,
+        config.inversion_type,
+    )
+
+
+def _omission_designs(station_table, active, settings):
+    if not settings["jackknife_opposing_station"]:
+        return [(int(i),) for i in active]
+    azimuth = station_table["azimuth"].to_numpy(dtype=float)
+    tolerance = settings["jackknife_opposition_tolerance_deg"]
+    return [
+        (i, j) for i, j in combinations(active, 2)
+        if abs((azimuth[i] - azimuth[j]) % 360.0 - 180.0) <= tolerance
+    ]
+
+
+def _jackknife_candidate(statistics, retained, omitted):
+    normal = statistics.normal[retained].sum(axis=0)
+    if not np.isfinite(normal).all():
+        return None
+    values = np.linalg.eigvalsh((normal + normal.T) * 0.5)
+    if values[0] <= values[-1] * len(values) * np.finfo(float).eps:
+        return None
+    energy = float(statistics.energy[retained].sum())
+    rhs = statistics.rhs[retained].sum(axis=0)
+    if not np.isfinite(rhs).all() or not np.isfinite(energy) or energy <= 0.0:
+        return None
+    try:
+        coeff = np.linalg.solve(normal, rhs)
+    except np.linalg.LinAlgError:
+        return None
+    tensor = coeff @ statistics.tensor_basis
+    if not np.isfinite(tensor).all():
+        return None
+    vr = 100.0 * (1.0 - max(0.0, float(energy - coeff @ rhs)) / energy)
+    observed_energy = float(statistics.energy[omitted].sum())
+    cross = float(statistics.rhs[omitted].sum(axis=0) @ coeff)
+    synthetic_energy = float(coeff @ statistics.normal[omitted].sum(axis=0) @ coeff)
+    heldout_error = max(0.0, observed_energy - 2.0 * cross + synthetic_energy)
+    return {
+        "loo_depth_km": statistics.depth_km,
+        "loo_reference_time_shift_s": statistics.shift_s,
+        "loo_total_vr_percent": vr,
+        "loo_condition_number": float(np.sqrt(values[-1] / values[0])),
+        "heldout_weighted_rms": np.sqrt(heldout_error / statistics.n_samples[omitted].sum()),
+        "heldout_vr_percent": 100.0 * (1.0 - heldout_error / observed_energy) if observed_energy > 0 else np.nan,
+        "tensor": tensor,
+        "inversion_type": statistics.inversion_type,
+    }
+
+
+def _station_jackknife(statistics, station_table, full, settings):
+    """Refit each omission on the already evaluated depth and shift grid."""
+    active = np.flatnonzero(statistics[0].n_samples)
+    ids = station_table["station"].to_numpy(dtype=str)
+    azimuth = station_table["azimuth"].to_numpy(dtype=float)
+    full_tensor = full.loc[list(_RESAMPLING_TENSOR_COLUMNS)].to_numpy(dtype=float)
+    mode = "opposing_pairs" if settings["jackknife_opposing_station"] else "leave_one_out"
+    rows = []
+    for omitted in _omission_designs(station_table, active, settings):
+        omitted = list(omitted)
+        retained = np.setdiff1d(active, omitted, assume_unique=True)
+        row = {
+            "station_id": ids[omitted[0]],
+            "opposing_station_id": ids[omitted[1]] if len(omitted) == 2 else "",
+            "mode": mode,
+            "n_omitted_stations": len(omitted),
+            "n_stations_remaining": len(retained),
+            "loo_azimuthal_gap_deg": _maximum_azimuth_gap_deg(np.deg2rad(azimuth[retained])),
+            "loo_n_azimuth_sectors": len(np.unique(azimuth[retained] // 45)),
+            "full_depth_km": float(full["depth_km"]),
+            "full_reference_time_shift_s": float(full["reference_time_shift"]),
+            "full_mw": float(full["mw"]),
+            "full_mo_dyne_cm": float(full["mo_dyne_cm"]),
+            "full_total_vr_percent": float(full["total_vr_percent"]),
+        }
+        if len(retained) < settings["jackknife_min_stations"]:
+            rows.append({**row, "status": "skipped", "reason": "insufficient_remaining_stations"})
+            continue
+        candidates = (_jackknife_candidate(trial, retained, omitted) for trial in statistics)
+        best = max((value for value in candidates if value is not None),
+                   key=lambda value: value["loo_total_vr_percent"], default=None)
+        if best is None:
+            rows.append({**row, "status": "skipped", "reason": "no_full_rank_finite_solution"})
+            continue
+        tensor = best.pop("tensor")
+        inversion_type = best.pop("inversion_type")
+        if not tensor.any():
+            rows.append({**row, "status": "skipped", "reason": "invalid_scalar_moment"})
+            continue
+        decomposition = _decompose_xyz_tensor(tensor, depth_km=best["loo_depth_km"], inversion_type=inversion_type)
+        try:
+            angle = kagan_angle_mt(_tensor6_to_matrix(full_tensor), _tensor6_to_matrix(tensor))
+        except ValueError:
+            angle = np.nan
+        rows.append({
+            **row, **best,
+            **{f"loo_{key[7:] if key.startswith('tensor_') else key}": value
+               for key, value in decomposition.items()},
+            "delta_depth_km": best["loo_depth_km"] - row["full_depth_km"],
+            "delta_time_s": best["loo_reference_time_shift_s"] - row["full_reference_time_shift_s"],
+            "delta_mw": decomposition["tensor_mw"] - row["full_mw"],
+            "delta_vr_percent": best["loo_total_vr_percent"] - row["full_total_vr_percent"],
+            "kagan_angle_deg": angle,
+            "status": "ok",
+            "reason": "",
+        })
+    if not rows:
+        rows.append({"mode": mode, "status": "skipped", "reason": "no_eligible_station_omissions"})
+    return pd.DataFrame(rows)
 
 
 def select_opposing_station_pairs(
@@ -6381,20 +7126,7 @@ def run_mttime_resampling(
 
     table["station_id"] = table["station_id"].astype(str)
 
-    base_drop = {
-        _normalize_station_selector(value)
-        for value in (base_drop_stations or [])
-    }
-
-    unknown_base_drop = sorted(
-        base_drop.difference(table["station_id"])
-    )
-
-    if unknown_base_drop:
-        raise ValueError(
-            "base_drop_stations contains identifiers absent from "
-            f"station_df: {unknown_base_drop}."
-        )
+    base_drop = _resolve_station_drops(table["station_id"], base_drop_stations, strict=True)
 
     pairing_table = table.loc[
         ~table["station_id"].isin(base_drop)
@@ -7732,6 +8464,27 @@ def _normalize_phase(value: str, name: str) -> str:
     if phase not in {"ORIGIN", "P", "S"}:
         raise ValueError(f"{name} must be 'origin', 'P' or 'S'.")
     return phase
+
+
+def _observation_window_settings(
+    *, dt, freqmax, window_start_phase="P", time_before_window_start=60.0,
+    window_end_phase="S", time_after_window_end=300.0, inversion_duration=150.0,
+    max_correlation_shift=5.0, max_reference_time_shift=0.0, reduction_velocity_km_s=0.0,
+):
+    phases = {
+        "window_start_phase": _normalize_phase(window_start_phase, "window_start_phase"),
+        "window_end_phase": _normalize_phase(window_end_phase, "window_end_phase"),
+    }
+    settings = dict(
+        time_before_window_start=float(time_before_window_start),
+        time_after_window_end=float(time_after_window_end),
+        inversion_duration=None if inversion_duration is None else float(inversion_duration),
+        max_correlation_shift=float(max_correlation_shift),
+        max_reference_time_shift=float(max_reference_time_shift),
+        reduction_velocity_km_s=float(reduction_velocity_km_s),
+    )
+    _validate_window_parameters(freqmax=freqmax, dt=dt, phases=phases.values(), **settings)
+    return {**phases, **settings}
 
 
 def _validate_window_parameters(
@@ -9362,7 +10115,7 @@ def _syngine_gf_processing_signature(
         "tensor_coordinates": "NED_x_north_y_east_z_down",
         "tensor_rotation": "alpha_deg=(180-azimuth_deg)%360",
         "tensor_bases": list(_TENSOR_BASES),
-        "reference_moment_Nm": _SYNGINE_MTTIME_REFERENCE_MOMENT_NM,
+        "reference_moment_Nm": _MTTIME_REFERENCE_MOMENT_NM,
         "si_to_cm_scale": _SYNGINE_SI_TO_CM_SCALE,
         "amplitude_scale": _SYNGINE_MTTIME_AMPLITUDE_SCALE,
         "settings": dict(settings),
@@ -10274,7 +11027,7 @@ def _validate_mtinv_files(
     if green == "herrmann":
         basis_order = _HERRMANN_BASES
     elif green == "tensor":
-        basis_order = _TENSOR_BASES
+        basis_order = tuple(basis for basis in _TENSOR_BASES if basis[0] in components)
     else:
         raise ValueError(
             f"Unsupported Green's-function format {green!r}."
@@ -10285,6 +11038,8 @@ def _validate_mtinv_files(
         if "requested_depth_km" in gf_manifest
         else "source_depth_km"
     )
+    table_depth_keys = gf_manifest[manifest_depth_col].astype(float).map(lambda value: f"{value:.4f}")
+    manifest_stations = gf_manifest["station_id"].astype(str)
 
     for row in table.itertuples(index=False):
         station_id = str(row.station_id)
@@ -10447,10 +11202,7 @@ def _validate_mtinv_files(
 
         for depth in depths:
             subset = gf_manifest.loc[
-                (gf_manifest["station_id"].astype(str) == station_id)
-                & np.isclose(
-                    gf_manifest[manifest_depth_col].astype(float), depth
-                )
+                manifest_stations.eq(station_id) & table_depth_keys.eq(f"{depth:.4f}")
             ]
             present = (
                 set(subset["basis"].astype(str))

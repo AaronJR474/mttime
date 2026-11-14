@@ -8,6 +8,10 @@ upstream inversion API stays recognizable.  Import either helper module directly
 
 PyFK is imported lazily by the functions that require it; Syngine workflows can
 therefore be used when PyFK is not installed.
+
+Use :func:`run_auto_cmt` to run the acquisition-through-inversion workflow.
 """
 
-__all__ = ["mttime_helpers", "gf_helpers"]
+from .mttime_helpers import run_auto_cmt
+
+__all__ = ["mttime_helpers", "gf_helpers", "run_auto_cmt"]

@@ -80,6 +80,7 @@ class Inversion(object):
         self.streams = None # a list of data streams
         self.moment_tensors = None
         self.preferred_tensor_id = None
+        self._station_statistics_hook = None
 
     def _load_data(self):
         """
@@ -145,6 +146,8 @@ class Inversion(object):
             self._correlate()
         self._data_to_d()
         self._weights()
+        if self._station_statistics_hook is not None:
+            self._station_statistics_hook(self, depth)
 
         ind = self.w != 0
         d = self.d[ind]
@@ -173,18 +176,14 @@ class Inversion(object):
         total_VR = (1 - var)*100
 
         # Station VR (unweighted)
-        masked = np.ma.masked_equal(self.w,0) # only compute misfit for components included in the inversion
-        dGm = masked * dGm
-        dd = masked * dd
-
-        station_VR = np.zeros((self.config.nsta,), dtype=np.float64)
+        station_VR = np.full(self.config.nsta, np.nan)
         for i in range(self.config.nsta):
             b = self.config.index1[i, 0]
             e = self.config.index2[i, -1]
-            var = dGm[b:e]
-            dvar = dd[b:e]
-            var = np.sum(var)/np.sum(dvar)
-            station_VR[i] = (1 - var) * 100
+            use = ind[b:e]
+            energy = dd[b:e][use].sum()
+            if energy > 0.0:
+                station_VR[i] = (1 - dGm[b:e][use].sum() / energy) * 100
 
         # Save solution
         #kwargs = dict(depth=depth,
@@ -421,13 +420,18 @@ class Inversion(object):
         if self.config.weight == "none":
             weights = 1
         elif self.config.weight == "distance":
-            weights = self.config.station_table.distance / np.min(self.config.station_table.distance)
+            # Normalizing by the nearest distance is a common scale factor.
+            # Use the distances directly when that factor would be zero.
+            distances = self.config.station_table.distance
+            nearest = distances.min()
+            weights = distances / nearest if nearest > 0.0 else distances
         elif self.config.weight == "variance":
             wei = np.zeros((self.config.nsta,))
             for i in range(self.config.nsta):
                 b = self.config.index1[i, 0]
                 e = self.config.index2[i, -1]
-                wei[i] = 1 / np.sum(self.d[b:e] ** 2)
+                energy = np.sum(self.d[b:e] ** 2)
+                wei[i] = 1 / energy if energy > 0.0 else 0.0
             weights = wei / np.sum(wei)
 
         self.config.station_table.weights = weights

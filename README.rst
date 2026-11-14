@@ -20,6 +20,7 @@ What this fork adds
     A high-level workflow from station/waveform acquisition through response
     removal, ZRT rotation, Green's-function generation, ``mtinv.in`` writing,
     inversion, timing/resampling studies and tabular/figure outputs.
+    ``run_auto_cmt`` runs those stages for a single event at a fixed epicentre.
 
 ``mttime.workflows.gf_helpers``
     Velocity-model utilities for fixed 1-D layered models and for extracting
@@ -29,9 +30,9 @@ What this fork adds
 
 Green's-function backends
     PyFK is the default local layered-Earth backend on Linux/WSL. EarthScope
-    Syngine is also supported and does not require PyFK. MTtime's existing core
-    support for externally generated tensor/3-D Green's functions remains
-    available.
+    Syngine and externally generated tensor/3-D Green's functions require no
+    PyFK installation. Select ``gf_source="pyfk"``, ``"syngine"`` or
+    ``"custom"`` in ``run_auto_cmt``.
 
 Helper-managed figures
     ``run_mttime_inversion(..., plot_views=...)`` accepts ``"waveform"``,
@@ -120,13 +121,18 @@ A typical helper-managed inversion ends with:
            path_to_data="event/processed/data",
            path_to_green="event/greens",
            degree=6,
+           azimuth_control=True,
+           station_jackknife={"jackknife_min_stations": 4},
            plot_views=("waveform", "depth", "map", "lune", "cmt"),
            show=False,
        )
    )
 
-See ``docs/source/workflows.rst`` for the backend contracts, 1-D/3-D model
-handling, Syngine route and output conventions.
+For a complete event run, use ``mttime_helpers.run_auto_cmt``. The default
+minimum acquisition radius is 0 km. The outer radius defaults to
+``get_max_radius(magnitude, scale_factor=1.66)``.
+``docs/source/workflows.rst`` has runnable examples for PyFK, Syngine and
+custom SW4 files, with the station-selection and jackknife options.
 
 License and attribution
 -----------------------
